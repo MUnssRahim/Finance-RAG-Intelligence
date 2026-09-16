@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Tuple
 
 from .db import execute_read
@@ -21,6 +22,7 @@ def extract_tokens(response) -> Tuple[int, int]:
 async def classify_query(query: str, workspace_id: str) -> Tuple[str, dict]:
     """Route queries from the uploaded workspace file types."""
     usage_dict = {"prompt_tokens": 0, "completion_tokens": 0}
+    logger.info("query_route_start workspace=%s query_chars=%s", workspace_id, len(query))
     
     # 1. Context-Aware File Check
     try:
@@ -36,8 +38,10 @@ async def classify_query(query: str, workspace_id: str) -> Tuple[str, dict]:
 
     # 2. Deterministic Routing (Bypass LLM)
     if has_csv and not has_text:
+        logger.info("query_route_decision workspace=%s route=STRUCTURED reason=structured_only", workspace_id)
         return "STRUCTURED", usage_dict
     if has_text and not has_csv:
+        logger.info("query_route_decision workspace=%s route=RAG reason=documents_only", workspace_id)
         return "RAG", usage_dict
 
     # 3. LLM Intent Routing
@@ -56,6 +60,7 @@ async def classify_query(query: str, workspace_id: str) -> Tuple[str, dict]:
             route = "STRUCTURED"
         if route not in {"STRUCTURED", "RAG", "HYBRID", "REPORT"}:
             route = "RAG"
+        logger.info("query_route_decision workspace=%s route=%s reason=llm", workspace_id, route)
         return route, usage_dict
     except json.JSONDecodeError:
         return "RAG", usage_dict
@@ -63,12 +68,13 @@ async def classify_query(query: str, workspace_id: str) -> Tuple[str, dict]:
 
 def retrieve_documents(query: str, workspace_id: str, top_k: int = None) -> list:
     """Fetches semantic chunks from Pinecone."""
+    logger.info("document_retrieval_start workspace=%s query_chars=%s top_k=%s", workspace_id, len(query), top_k or settings.retrieval_top_k)
     embeddings = generate_embeddings([query], input_type="search_query")
     if not embeddings:
         return []
         
     matches = retrieve_vectors(workspace_id, embeddings[0], top_k or settings.retrieval_top_k)
-    return [
+    documents = [
         {
             "document_id": match.get("metadata", {}).get("document_id", ""),
             "chunk_id": match.get("metadata", {}).get("chunk_id", match.get("id", "")),
@@ -80,6 +86,8 @@ def retrieve_documents(query: str, workspace_id: str, top_k: int = None) -> list
         } 
         for match in matches
     ]
+    logger.info("document_retrieval_complete workspace=%s matches=%s scores=%s", workspace_id, len(documents), [round(float(item["score"]), 4) for item in documents])
+    return documents
 
 
 async def process_user_query(query: str, workspace_id: str) -> dict:
@@ -87,6 +95,8 @@ async def process_user_query(query: str, workspace_id: str) -> dict:
     total_prompt_tokens = 0
     total_completion_tokens = 0
 
+    started = time.perf_counter()
+    logger.info("query_pipeline_start workspace=%s query_chars=%s", workspace_id, len(query))
     # 1. Routing
     route, router_usage = await classify_query(query, workspace_id)
     total_prompt_tokens += router_usage["prompt_tokens"]
@@ -131,7 +141,7 @@ async def process_user_query(query: str, workspace_id: str) -> dict:
     if pandas_data.get("error"):
         structured_evidence["error"] = pandas_data["error"]
 
-    return {
+    result = {
         "route": route,
         "answer": answer.content,
         "sql_evidence": structured_evidence,
@@ -141,3 +151,5 @@ async def process_user_query(query: str, workspace_id: str) -> dict:
             "completion_tokens": total_completion_tokens
         }
     }
+    logger.info("query_pipeline_complete workspace=%s route=%s documents=%s structured=%s duration_ms=%.1f", workspace_id, route, len(documents), pandas_data.get("data") is not None, (time.perf_counter() - started) * 1000)
+    return result

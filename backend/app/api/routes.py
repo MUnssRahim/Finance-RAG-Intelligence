@@ -28,6 +28,7 @@ router = APIRouter()
 @router.post("/workspaces", response_model=WorkspaceResponse)
 async def create_workspace(workspace: WorkspaceCreate):
     workspace_id = str(uuid.uuid4())
+    logger.info("workspace_create_start workspace=%s name=%s industry=%s", workspace_id, workspace.name, workspace.industry)
     try:
         sql = """
         INSERT INTO workspaces (workspace_id, name, industry, currency, reporting_period, description)
@@ -44,9 +45,10 @@ async def create_workspace(workspace: WorkspaceCreate):
                 workspace.description,
             ),
         )
+        logger.info("workspace_create_success workspace=%s", workspace_id)
         return WorkspaceResponse(workspace_id=workspace_id, status="created")
     except Exception as e:
-        logger.error(f"Error creating workspace: {str(e)}")
+        logger.exception("workspace_create_error workspace=%s", workspace_id)
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
@@ -54,10 +56,12 @@ async def create_workspace(workspace: WorkspaceCreate):
 # 2. File Upload & Background Ingestion Pipeline
 # -------------------------------------------------------------------------
 def process_upload_task(workspace_id: str, files_info: List[dict]):
+    logger.info("upload_background_start workspace=%s file_count=%s", workspace_id, len(files_info))
     try:
-        run_concurrent_ingestion(workspace_id, files_info)
+        results = run_concurrent_ingestion(workspace_id, files_info)
+        logger.info("upload_background_complete workspace=%s results=%s", workspace_id, [result.get("status") for result in results])
     except Exception as e:
-        logger.error(f"Ingestion failed for workspace {workspace_id}: {str(e)}")
+        logger.exception("upload_background_error workspace=%s", workspace_id)
 
 
 @router.post("/workspaces/{workspace_id}/upload")
@@ -66,12 +70,14 @@ async def upload_files(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
 ):
+    logger.info("upload_request_start workspace=%s file_count=%s", workspace_id, len(files))
     os.makedirs(settings.upload_dir, exist_ok=True)
     files_info = []
 
     for file in files:
         file_ext = file.filename.split(".")[-1].lower()
         content = await file.read()
+        logger.info("upload_file_received workspace=%s filename=%s type=%s bytes=%s", workspace_id, file.filename, file_ext, len(content))
         if file_ext in {"csv", "xlsx"}:
             filepath = save_structured_file(workspace_id, file.filename, content)
         else:
@@ -87,6 +93,7 @@ async def upload_files(
 
     # Dispatch ingestion to a background task so client gets instant feedback
     background_tasks.add_task(process_upload_task, workspace_id, files_info)
+    logger.info("upload_request_queued workspace=%s file_count=%s", workspace_id, len(files_info))
     return {"status": "ingestion_queued", "files_count": len(files_info)}
 
 
@@ -96,6 +103,7 @@ async def upload_files(
 @router.post("/workspaces/{workspace_id}/query", response_model=QueryResponse)
 async def query_workspace(workspace_id: str, request: QueryRequest):
     start_time = time.time()
+    logger.info("query_request_start workspace=%s query_chars=%s", workspace_id, len(request.query))
     error_msg = None
     status = "success"
     response_data = {}
@@ -105,7 +113,7 @@ async def query_workspace(workspace_id: str, request: QueryRequest):
     except Exception as e:
         error_msg = str(e)
         status = "error"
-        logger.error(f"Query failed: {error_msg}")
+        logger.exception("query_request_error workspace=%s", workspace_id)
         raise HTTPException(status_code=500, detail="Query processing failed")
     finally:
         latency = time.time() - start_time
@@ -130,7 +138,9 @@ async def query_workspace(workspace_id: str, request: QueryRequest):
                 doc_evidence=response_data.get("document_evidence", []),
             )
         except Exception as telemetry_error:
-            logger.error(f"Telemetry logging failed: {telemetry_error}")
+            logger.exception("query_telemetry_error workspace=%s", workspace_id)
+
+        logger.info("query_request_complete workspace=%s status=%s route=%s input_tokens=%s output_tokens=%s duration_ms=%.1f", workspace_id, status, response_data.get("route", "UNKNOWN"), input_tokens, output_tokens, latency * 1000)
 
     return QueryResponse(
         route=response_data.get("route", "UNKNOWN"),
@@ -145,6 +155,7 @@ async def query_workspace(workspace_id: str, request: QueryRequest):
 # -------------------------------------------------------------------------
 @router.get("/workspaces/{workspace_id}/datasets")
 async def get_workspace_datasets(workspace_id: str):
+    logger.info("datasets_request_start workspace=%s", workspace_id)
     sql = """
     SELECT dataset_id, filename, file_type, row_count, quality_score, created_at
     FROM datasets 
@@ -153,14 +164,34 @@ async def get_workspace_datasets(workspace_id: str):
     """
     try:
         rows = execute_read(sql, (workspace_id,))
+        logger.info("datasets_request_complete workspace=%s count=%s", workspace_id, len(rows or []))
         return {"datasets": rows or []}
     except Exception as e:
         logger.error(f"Failed to fetch datasets: {e}")
         return {"datasets": []}
 
 
+@router.get("/workspaces/{workspace_id}/documents")
+async def get_workspace_documents(workspace_id: str):
+    logger.info("documents_request_start workspace=%s", workspace_id)
+    sql = """
+    SELECT document_id, filename, chunk_count, version, created_at
+    FROM documents
+    WHERE workspace_id = %s AND active = TRUE
+    ORDER BY created_at DESC
+    """
+    try:
+        rows = execute_read(sql, (workspace_id,))
+        logger.info("documents_request_complete workspace=%s count=%s", workspace_id, len(rows or []))
+        return {"documents": rows or []}
+    except Exception as e:
+        logger.error(f"Failed to fetch documents: {e}")
+        return {"documents": []}
+
+
 @router.get("/workspaces/{workspace_id}/telemetry")
 async def get_workspace_telemetry(workspace_id: str):
+    logger.info("telemetry_request_start workspace=%s", workspace_id)
     sql = """
     SELECT request_id, query, route, latency, total_cost, status, created_at
     FROM audit_logs 
@@ -170,6 +201,7 @@ async def get_workspace_telemetry(workspace_id: str):
     """
     try:
         rows = execute_read(sql, (workspace_id, settings.telemetry_limit))
+        logger.info("telemetry_request_complete workspace=%s count=%s", workspace_id, len(rows or []))
         return {"logs": rows or []}
     except Exception as e:
         logger.error(f"Failed to fetch telemetry: {e}")

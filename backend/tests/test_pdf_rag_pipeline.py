@@ -7,10 +7,23 @@ from fastapi.testclient import TestClient
 from app import ingestion, query
 from app.api import routes
 from app.main import app
-from app.providers import LLMResponse
+from app.providers import LLMResponse, generate_embeddings
 
 
 WORKSPACE_ID = "test-workspace"
+
+
+def test_cohere_embeddings_payload_is_normalized(monkeypatch):
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"embeddings": {"float": [[0.1, 0.2], [0.3, 0.4]]}}
+
+    monkeypatch.setattr("app.providers.httpx.post", lambda *args, **kwargs: FakeResponse())
+
+    assert generate_embeddings(["one", "two"]) == [[0.1, 0.2], [0.3, 0.4]]
 
 
 def create_pdf(path: Path, text: str = "Revenue increased by 25 percent in Q4.") -> bytes:

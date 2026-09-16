@@ -1,8 +1,15 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 
 from .api.routes import router
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 app = FastAPI(title=settings.app_name, version=settings.api_version)
 
@@ -18,4 +25,5 @@ app.include_router(router, prefix=settings.api_prefix)
 
 @app.get("/health")
 async def health_check():
+    logging.getLogger(__name__).info("health_check status=ok")
     return {"status": "healthy"}
